@@ -112,141 +112,42 @@ class Registry:
             del self._data["instances"][name]
             self._save()
 
-    def update(self, instance: Instance):
-        self._data["instances"][instance.name] = instance.to_dict()
+    def update_port_counter(self, value: int):
+        self._data["port_counter"] = value
         self._save()
 
-    def next_port(self) -> int:
-        """Get next available port (checks registry and system)"""
-        instances = self.get_all()
-        used_ports = {i.port for i in instances.values()}
-
-        port = BASE_PORT
-        while port in used_ports or self.is_port_listening(port):
-            port += PORT_INCREMENT
-        return port
-
-    def port_in_use(self, port: int) -> bool:
-        """Check if port is already assigned in registry"""
-        return any(i.port == port for i in self.get_all().values())
-
-    @staticmethod
-    def is_port_listening(port: int) -> bool:
-        """Check if port is actually listening on the system"""
-        try:
-            result = subprocess.run(
-                f"ss -tlnp | grep ':{port}'", capture_output=True, text=True, shell=True
-            )
-            return result.returncode == 0 and str(port) in result.stdout
-        except:
-            return False
+    def get_port_counter(self) -> int:
+        return self._data.get("port_counter", 0)
 
 
-class UFWManager:
-    """Manages UFW firewall rules"""
+class PortManager:
+    """Manages port allocation for instances"""
 
-    @staticmethod
-    def is_enabled() -> bool:
-        """Check if UFW is enabled"""
-        try:
-            result = subprocess.run(
-                ["sudo", "ufw", "status"], capture_output=True, text=True
-            )
-            return "Status: active" in result.stdout
-        except:
-            return False
+    def __init__(self, registry: Registry):
+        self.registry = registry
 
-    @staticmethod
-    def allow_port(port: int, name: str) -> bool:
-        """Allow port through UFW"""
-        try:
-            result = subprocess.run(
-                ["sudo", "ufw", "allow", str(port), "comment", f"OpenClaw {name}"],
-                capture_output=True,
-                text=True,
-            )
-            return result.returncode == 0
-        except Exception as e:
-            print(f"Warning: Failed to add UFW rule: {e}")
-            return False
+    def allocate_port(self) -> int:
+        """Allocate next available port"""
+        used_ports = {instance.port for instance in self.registry.get_all().values()}
+        counter = self.registry.get_port_counter()
 
-    @staticmethod
-    def allow_port_localhost(port: int, name: str) -> bool:
-        """Allow port through UFW (localhost only - more secure)"""
-        try:
-            # Allow only from localhost/127.0.0.1 since gateway binds to loopback
-            result = subprocess.run(
-                [
-                    "sudo",
-                    "ufw",
-                    "allow",
-                    "from",
-                    "127.0.0.1",
-                    "to",
-                    "any",
-                    "port",
-                    str(port),
-                    "comment",
-                    f"OpenClaw {name} localhost",
-                ],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0:
-                print(f"  UFW: Added localhost-only rule for port {port}")
-                return True
-            else:
-                # Fallback to regular allow if localhost rule fails
-                print(
-                    f"  Warning: Could not add localhost-only rule, falling back to regular allow"
-                )
-                return UFWManager.allow_port(port, name)
-        except Exception as e:
-            print(f"Warning: Failed to add UFW rule: {e}")
-            return False
+        while True:
+            port = BASE_PORT + (counter * PORT_INCREMENT)
+            if port not in used_ports:
+                self.registry.update_port_counter(counter + 1)
+                return port
+            counter += 1
 
-    @staticmethod
-    def delete_port(port: int) -> bool:
-        """Remove UFW rule for port"""
-        try:
-            subprocess.run(
-                ["sudo", "ufw", "delete", "allow", str(port)],
-                capture_output=True,
-                text=True,
-            )
-            return True
-        except Exception as e:
-            print(f"Warning: Failed to remove UFW rule: {e}")
-            return False
-
-    @staticmethod
-    def list_rules():
-        """List all UFW rules"""
-        try:
-            result = subprocess.run(
-                ["sudo", "ufw", "status", "numbered"],
-                capture_output=True,
-                text=True,
-            )
-            return result.stdout
-        except:
-            return "Unable to get UFW rules"
+    def get_port_for_instance(self, name: str) -> int:
+        """Get or allocate port for instance"""
+        instance = self.registry.get(name)
+        if instance:
+            return instance.port
+        return self.allocate_port()
 
 
 class ConfigInheritor:
     """Handles configuration inheritance from main instance"""
-
-    INHERIT_KEYS = [
-        "agent.model",
-        "providers",
-        "models",
-    ]
-
-    EXCLUDE_PATTERNS = [
-        "tailscale",
-        "gateway.tailscale",
-        "tailscale.*",
-    ]
 
     @classmethod
     def load_main_config(cls) -> dict:
@@ -259,28 +160,32 @@ class ConfigInheritor:
 
     @classmethod
     def extract_inheritable(cls, config: dict) -> dict:
-        """Extract only inheritable settings"""
+        """Extract settings that should be inherited by new instances"""
         inherited = {}
 
+        # Inherit agent defaults (models)
         if "agents" in config and "defaults" in config["agents"]:
             defaults = config["agents"]["defaults"]
             inherited["agents"] = {"defaults": {}}
 
+            # Copy model configuration
             if "model" in defaults:
                 inherited["agents"]["defaults"]["model"] = defaults["model"]
             if "models" in defaults:
                 inherited["agents"]["defaults"]["models"] = defaults["models"]
 
+        # Inherit providers (without sensitive data like API keys)
         if "providers" in config:
             inherited["providers"] = {}
             for provider_name, provider_config in config["providers"].items():
-                if "tailscale" not in provider_name.lower():
+                # Only copy safe provider settings (not API keys)
+                if "baseUrl" in provider_config:
                     inherited["providers"][provider_name] = {
-                        k: v
-                        for k, v in provider_config.items()
-                        if k in ["baseURL", "apiKey", "models", "baseUrl", "api"]
+                        "baseUrl": provider_config["baseUrl"],
+                        "api": provider_config.get("api", "openai"),
                     }
 
+        # Inherit models configuration
         if "models" in config:
             inherited["models"] = config["models"]
 
@@ -323,6 +228,11 @@ class ConfigInheritor:
             "compaction": {"mode": "safeguard"},
             "maxConcurrent": 4,
             "subagents": {"maxConcurrent": 8},
+            "sandbox": {
+                "mode": "non-main",
+                "scope": "agent",
+                "workspaceAccess": "rw"
+            },
         }
 
         # If model is specified, set it as primary
@@ -346,6 +256,12 @@ class ConfigInheritor:
         if "defaults" not in new_config["agents"]:
             new_config["agents"]["defaults"] = {}
         new_config["agents"]["defaults"].update(instance_agents_defaults)
+
+        # Add session security settings
+        if "session" not in new_config:
+            new_config["session"] = {}
+        new_config["session"]["dmScope"] = "per-channel-peer"
+
 
         # If no template was used, try to inherit from main config
         if not cls.TEMPLATE_PATH.exists():
@@ -385,6 +301,27 @@ Environment=OPENCLAW_PROFILE={profile}
 Environment=OPENCLAW_STATE_DIR={state_dir}
 Environment=OPENCLAW_CONFIG_PATH={config_path}
 
+# STRICT ISOLATION: Instance can only access its own files
+ProtectSystem=strict
+# ProtectHome disabled for user service
+
+# Read-Write: Only instance state directory and temp
+ReadWritePaths={state_dir} /tmp /var/tmp
+
+# Read-Only: Only this instance config file (bind-mounted)
+BindPaths={config_path}:{config_path}
+
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+
 [Install]
 WantedBy=default.target
 """
@@ -413,106 +350,95 @@ WantedBy=default.target
     def create_service(cls, instance: Instance) -> bool:
         """Create systemd service file for instance"""
         try:
+            node_path = cls._get_node_path()
+            path_env = cls._get_path_env()
+            home = str(Path.home())
+
             service_content = cls.SERVICE_TEMPLATE.format(
                 name=instance.name,
+                node_path=node_path,
+                openclaw_path=str(OPENCLAW_BIN),
                 profile=instance.name,
                 port=instance.port,
-                node_path=cls._get_node_path(),
-                openclaw_path=str(OPENCLAW_BIN),
-                home=str(Path.home()),
-                path=cls._get_path_env(),
+                home=home,
+                path=path_env,
                 state_dir=str(instance.state_dir()),
                 config_path=str(instance.config_path()),
             )
 
-            with open(instance.service_path(), "w") as f:
-                f.write(service_content)
+            # Write service file
+            instance.service_path().write_text(service_content)
 
+            # Set permissions
+            os.chmod(instance.service_path(), 0o644)
+
+            # Reload systemd
             subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+
             return True
+
         except Exception as e:
-            print(f"Error creating service: {e}")
+            print(f"  Error creating service: {e}")
             return False
 
     @classmethod
-    def delete_service(cls, instance: Instance) -> bool:
-        """Delete systemd service file"""
+    def start_service(cls, instance: Instance) -> bool:
+        """Start the systemd service"""
         try:
-            if instance.service_path().exists():
-                instance.service_path().unlink()
-                subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-            return True
+            result = subprocess.run(
+                ["systemctl", "--user", "start", instance.service_name()],
+                capture_output=True,
+                text=True,
+            )
+            return result.returncode == 0
         except Exception as e:
-            print(f"Error deleting service: {e}")
+            print(f"  Error starting service: {e}")
             return False
 
     @classmethod
-    def enable_autostart(cls, instance: Instance) -> bool:
+    def stop_service(cls, instance: Instance) -> bool:
+        """Stop the systemd service"""
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "stop", instance.service_name()],
+                capture_output=True,
+                text=True,
+            )
+            return result.returncode == 0
+        except Exception as e:
+            print(f"  Error stopping service: {e}")
+            return False
+
+    @classmethod
+    def enable_service(cls, instance: Instance) -> bool:
         """Enable service to start on boot"""
         try:
-            subprocess.run(
-                ["systemctl", "--user", "enable", instance.service_name()], check=True
+            result = subprocess.run(
+                ["systemctl", "--user", "enable", instance.service_name()],
+                capture_output=True,
+                text=True,
             )
-            instance.autostart = True
-            return True
+            return result.returncode == 0
         except Exception as e:
-            print(f"Error enabling autostart: {e}")
+            print(f"  Error enabling service: {e}")
             return False
 
     @classmethod
-    def disable_autostart(cls, instance: Instance) -> bool:
+    def disable_service(cls, instance: Instance) -> bool:
         """Disable service from starting on boot"""
         try:
-            subprocess.run(
-                ["systemctl", "--user", "disable", instance.service_name()], check=True
+            result = subprocess.run(
+                ["systemctl", "--user", "disable", instance.service_name()],
+                capture_output=True,
+                text=True,
             )
-            instance.autostart = False
-            return True
+            return result.returncode == 0
         except Exception as e:
-            print(f"Error disabling autostart: {e}")
+            print(f"  Error disabling service: {e}")
             return False
 
     @classmethod
-    def start(cls, instance: Instance) -> bool:
-        """Start the service"""
-        try:
-            subprocess.run(
-                ["systemctl", "--user", "start", instance.service_name()], check=True
-            )
-            instance.status = "running"
-            return True
-        except Exception as e:
-            print(f"Error starting service: {e}")
-            return False
-
-    @classmethod
-    def stop(cls, instance: Instance) -> bool:
-        """Stop the service"""
-        try:
-            subprocess.run(
-                ["systemctl", "--user", "stop", instance.service_name()], check=True
-            )
-            instance.status = "stopped"
-            return True
-        except Exception as e:
-            print(f"Error stopping service: {e}")
-            return False
-
-    @classmethod
-    def restart(cls, instance: Instance) -> bool:
-        """Restart the service"""
-        try:
-            subprocess.run(
-                ["systemctl", "--user", "restart", instance.service_name()], check=True
-            )
-            instance.status = "running"
-            return True
-        except Exception as e:
-            print(f"Error restarting service: {e}")
-            return False
-
-    @classmethod
-    def get_status(cls, instance: Instance) -> str:
+    def get_service_status(cls, instance: Instance) -> str:
         """Get service status"""
         try:
             result = subprocess.run(
@@ -520,438 +446,224 @@ WantedBy=default.target
                 capture_output=True,
                 text=True,
             )
-            return result.stdout.strip()
-        except:
+            return result.stdout.strip() if result.returncode == 0 else "inactive"
+        except Exception:
             return "unknown"
+
+    @classmethod
+    def remove_service(cls, instance: Instance) -> bool:
+        """Remove systemd service file"""
+        try:
+            # Stop and disable first
+            cls.stop_service(instance)
+            cls.disable_service(instance)
+
+            # Remove service file
+            if instance.service_path().exists():
+                instance.service_path().unlink()
+
+            # Reload systemd
+            subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+
+            return True
+
+        except Exception as e:
+            print(f"  Error removing service: {e}")
+            return False
 
 
 class OpenClawManager:
-    """Main manager class"""
+    """Main manager class for OpenClaw instances"""
 
     def __init__(self):
         self.registry = Registry()
-        self.ufw = UFWManager()
-
-    def update_models(self) -> bool:
-        """Fetch models from PPQ AI and update main openclaw.json config"""
-        config_path = Path.home() / ".openclaw" / "openclaw.json"
-
-        try:
-            with open(config_path, "r") as f:
-                config = json.load(f)
-        except FileNotFoundError:
-            print(f"Error: Config not found at {config_path}")
-            return False
-        except json.JSONDecodeError as e:
-            print(f"Error: Invalid JSON in config: {e}")
-            return False
-
-        print("Fetching models from PPQ AI...")
-
-        try:
-            ssl_context = ssl.create_default_context()
-            req = urllib.request.Request(
-                "https://api.ppq.ai/v1/models", headers={"Accept": "application/json"}
-            )
-
-            with urllib.request.urlopen(
-                req, context=ssl_context, timeout=30
-            ) as response:
-                data = json.loads(response.read().decode("utf-8"))
-        except Exception as e:
-            print(f"Error fetching models: {e}")
-            return False
-
-        if "data" not in data or not isinstance(data["data"], list):
-            print("Error: Unexpected API response format")
-            return False
-
-        api_key = None
-        if "models" in config and "providers" in config["models"]:
-            for provider_name, provider_config in config["models"]["providers"].items():
-                if "apiKey" in provider_config:
-                    api_key = provider_config["apiKey"]
-                    break
-
-        if not api_key:
-            print("Warning: No existing API key found in config")
-
-        models = []
-        for model in data["data"]:
-            model_entry = {
-                "id": model["id"],
-                "name": f"{model.get('name', model['id'])} ({model.get('provider', 'Unknown')})",
-                "reasoning": model.get("id", "").startswith(
-                    ("claude-opus", "claude-sonnet", "gpt-5")
-                ),
-                "input": ["text"],
-                "cost": {
-                    "input": model.get("pricing", {})
-                    .get("api", {})
-                    .get("input_per_1M", 0),
-                    "output": model.get("pricing", {})
-                    .get("api", {})
-                    .get("output_per_1M", 0),
-                    "cacheRead": 0,
-                    "cacheWrite": 0,
-                },
-                "contextWindow": model.get("context_length", 128000),
-                "maxTokens": min(16384, model.get("context_length", 16384)),
-            }
-            models.append(model_entry)
-
-        print(f"Found {len(models)} models")
-
-        if "models" not in config:
-            config["models"] = {}
-
-        config["models"]["mode"] = "merge"
-        config["models"]["providers"] = {
-            "custom-api-ppq-ai": {
-                "baseUrl": "https://api.ppq.ai",
-                "apiKey": api_key or "",
-                "api": "openai-completions",
-                "models": models,
-            }
-        }
-
-        backup_path = (
-            Path.home()
-            / ".openclaw"
-            / f"openclaw.json.bak.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        )
-        try:
-            shutil.copy2(config_path, backup_path)
-            print(f"Backup created: {backup_path}")
-        except Exception as e:
-            print(f"Warning: Could not create backup: {e}")
-
-        try:
-            with open(config_path, "w") as f:
-                json.dump(config, f, indent=4)
-            print(f"✓ Models updated in {config_path}")
-            print(f"  Added {len(models)} models from PPQ AI")
-            return True
-        except Exception as e:
-            print(f"Error saving config: {e}")
-            return False
+        self.port_manager = PortManager(self.registry)
+        self.config_inheritor = ConfigInheritor()
 
     def create_instance(
-        self, name: str, port: Optional[int] = None, model: Optional[str] = None
+        self, name: str, model: Optional[str] = None, autostart: bool = False
     ) -> bool:
         """Create a new OpenClaw instance"""
+        print(f"Creating instance '{name}'...")
 
+        # Validate name
         if not re.match(r"^[a-zA-Z0-9_-]+$", name):
-            print(
-                f"Error: Invalid instance name '{name}'. Use only alphanumeric, hyphens, and underscores."
-            )
+            print("  Error: Name must contain only alphanumeric characters, hyphens, and underscores")
             return False
 
-        if name == MAIN_PROFILE:
-            print(f"Error: Cannot create instance named '{MAIN_PROFILE}' (reserved)")
-            return False
-
+        # Check if instance already exists
         if self.registry.get(name):
-            print(f"Error: Instance '{name}' already exists")
+            print(f"  Error: Instance '{name}' already exists")
             return False
 
-        if port is None:
-            port = self.registry.next_port()
-        elif self.registry.port_in_use(port):
-            print(f"Error: Port {port} is already in use")
-            return False
-
-        print(f"Creating instance '{name}' on port {port}...")
-
-        instance = Instance(
-            name=name,
-            port=port,
-            profile=name,
-            created_at=datetime.now().isoformat(),
-            model=model or "",
-        )
+        # Allocate port
+        port = self.port_manager.allocate_port()
+        print(f"  Allocated port: {port}")
 
         try:
+            # Create instance object
+            instance = Instance(
+                name=name,
+                port=port,
+                profile=name,
+                created_at=datetime.now().isoformat(),
+                autostart=autostart,
+                status="stopped",
+                model=model or "",
+            )
+
+            # Create state directory
             instance.state_dir().mkdir(parents=True, exist_ok=True)
             (instance.state_dir() / "workspace").mkdir(exist_ok=True)
             (instance.state_dir() / "agents").mkdir(exist_ok=True)
             (instance.state_dir() / "agents" / "main").mkdir(exist_ok=True)
             (instance.state_dir() / "agents" / "main" / "sessions").mkdir(exist_ok=True)
-            (instance.state_dir() / "credentials").mkdir(exist_ok=True)
 
+            # Set permissions
+            os.chmod(instance.state_dir(), 0o700)
+
+            # Create config
             config = ConfigInheritor.create_instance_config(name, port, model)
-            if model:
-                instance.model = model
 
+            # Write config file
             with open(instance.config_path(), "w") as f:
                 json.dump(config, f, indent=2)
 
-            # Secure file permissions
-            self._secure_instance_permissions(instance)
+            # Set config file permissions
+            os.chmod(instance.config_path(), 0o600)
+            print(f"  Config: {instance.config_path()}")
 
+            # Create systemd service
             if not SystemdManager.create_service(instance):
-                raise Exception("Failed to create systemd service")
+                print("  Error: Failed to create systemd service")
+                # Cleanup
+                shutil.rmtree(instance.state_dir(), ignore_errors=True)
+                if instance.config_path().exists():
+                    instance.config_path().unlink()
+                return False
 
-            # Add UFW rule (localhost only since gateway binds to loopback)
-            if self.ufw.is_enabled():
-                self.ufw.allow_port_localhost(port, name)
+            print(f"  Service: {instance.service_path()}")
 
+            # Add to registry
             self.registry.add(instance)
+
+            # Enable autostart if requested
+            if autostart:
+                SystemdManager.enable_service(instance)
+                print("  Autostart: enabled")
 
             print(f"✓ Instance '{name}' created successfully")
             print(f"  Port: {port}")
-            print(f"  Config: {instance.config_path()}")
-            print(f"  State: {instance.state_dir()}")
-            print(f"  Service: {instance.service_name()}")
-
-            # Auto-enable autostart for convenience
-            SystemdManager.enable_autostart(instance)
-            print(f"  Autostart: enabled")
+            print(f"  Start with: ocm start {name}")
 
             return True
 
         except Exception as e:
-            print(f"Error creating instance: {e}")
-            self._cleanup_partial(instance)
-            return False
-
-    def _secure_instance_permissions(self, instance: Instance):
-        """Apply secure file permissions to instance files"""
-        try:
-            import stat
-
-            # Config file: owner read/write only (600)
-            if instance.config_path().exists():
-                os.chmod(instance.config_path(), stat.S_IRUSR | stat.S_IWUSR)
-                print(f"  Secured: config file permissions (600)")
-
-            # State dir: owner rwx only (700)
-            if instance.state_dir().exists():
-                os.chmod(instance.state_dir(), stat.S_IRWXU)
-
-            # Credentials dir: owner rwx only (700)
-            creds_dir = instance.state_dir() / "credentials"
-            if creds_dir.exists():
-                os.chmod(creds_dir, stat.S_IRWXU)
-
-            # Recursively secure sensitive directories
-            for subdir in ["agents", "credentials", "identity"]:
-                path = instance.state_dir() / subdir
-                if path.exists():
-                    for root, dirs, files in os.walk(path):
-                        for d in dirs:
-                            os.chmod(os.path.join(root, d), stat.S_IRWXU)
-                        for f in files:
-                            fpath = os.path.join(root, f)
-                            os.chmod(fpath, stat.S_IRUSR | stat.S_IWUSR)
-
-            print(f"  Secured: state directory permissions (700)")
-        except Exception as e:
-            print(f"  Warning: Could not secure permissions: {e}")
-
-    def _cleanup_partial(self, instance: Instance):
-        """Cleanup partial creation"""
-        try:
-            if instance.state_dir().exists():
-                shutil.rmtree(instance.state_dir())
-            if instance.config_path().exists():
-                instance.config_path().unlink()
-            if instance.service_path().exists():
-                instance.service_path().unlink()
-        except:
-            pass
-
-    def deploy_instance(
-        self,
-        name: str,
-        port: Optional[int] = None,
-        model: Optional[str] = None,
-        run_test: bool = True,
-    ) -> bool:
-        """One-step deployment: create, start, and verify an instance"""
-        print(f"\n🚀 Deploying instance '{name}'...")
-        print("=" * 50)
-
-        # Step 1: Create
-        if not self.create_instance(name, port, model):
-            return False
-
-        # Step 2: Start
-        print(f"\n▶️  Starting instance '{name}'...")
-        if not self.start_instance(name):
-            print(
-                f"⚠️  Instance created but failed to start. Check logs with: ocm logs {name}"
-            )
-            return False
-
-        # Step 3: Wait for service to be ready
-        print(f"⏳ Waiting for instance to be ready...")
-        import time
-
-        time.sleep(3)
-
-        # Step 4: Health check
-        instance = self.registry.get(name)
-        if not instance:
-            print(f"❌ Instance '{name}' not found in registry after creation")
-            return False
-
-        service_status = SystemdManager.get_status(instance)
-        if service_status == "active":
-            print(f"✅ Instance '{name}' is running on port {instance.port}")
-        else:
-            print(f"⚠️  Instance status: {service_status}")
-            return False
-
-        # Step 5: Optional test
-        if run_test:
-            print(f"\n🧪 Running connectivity test...")
+            print(f"  Error creating instance: {e}")
+            # Cleanup on error
             try:
-                # Set up environment for openclaw command
-                env = os.environ.copy()
-                env["OPENCLAW_PROFILE"] = name
-                env["OPENCLAW_STATE_DIR"] = str(instance.state_dir())
-                env["OPENCLAW_CONFIG_PATH"] = str(instance.config_path())
-                env["OPENCLAW_GATEWAY_PORT"] = str(instance.port)
-
-                # Run a simple health check via openclaw
-                result = subprocess.run(
-                    [str(OPENCLAW_BIN), "--profile", name, "health"],
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                )
-
-                if result.returncode == 0:
-                    print(f"✅ Health check passed!")
-                else:
-                    print(f"⚠️  Health check returned non-zero exit code")
-
-                # Test actual agent query
-                print(f"🧪 Testing agent response...")
-                test_result = subprocess.run(
-                    [
-                        str(OPENCLAW_BIN),
-                        "--profile",
-                        name,
-                        "agent",
-                        "--agent",
-                        "main",
-                        "--message",
-                        "Say 'OK'",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=60,
-                )
-
-                if test_result.returncode == 0 and test_result.stdout.strip():
-                    response = test_result.stdout.strip().split("\n")[0]
-                    print(f"✅ Agent responded: '{response}'")
-                    print(f"\n🎉 Instance '{name}' deployed successfully!")
-                    print(f"   Port: {instance.port}")
-                    print(f"   Dashboard: http://127.0.0.1:{instance.port}/")
-                    print(
-                        f"   Test command: ocm use {name} agent --agent main --message 'Hello'"
-                    )
-                    return True
-                else:
-                    print(f"⚠️  Agent test failed - instance may still be initializing")
-                    print(
-                        f"   Try again in a few seconds: ocm use {name} agent --agent main --message 'Hello'"
-                    )
-                    return True  # Still consider deployment successful
-
-            except subprocess.TimeoutExpired:
-                print(f"⚠️  Test timed out - instance may still be initializing")
-                return True
-            except Exception as e:
-                print(f"⚠️  Test error: {e}")
-                return True  # Instance is running even if test failed
-
-        return True
+                shutil.rmtree(instance.state_dir(), ignore_errors=True)
+                if instance.config_path().exists():
+                    instance.config_path().unlink()
+            except:
+                pass
+            return False
 
     def delete_instance(self, name: str, force: bool = False) -> bool:
-        """Delete an instance"""
+        """Delete an OpenClaw instance"""
         instance = self.registry.get(name)
         if not instance:
             print(f"Error: Instance '{name}' not found")
             return False
 
-        if name == MAIN_PROFILE:
-            print(f"Error: Cannot delete main instance")
-            return False
-
-        if not force:
-            confirm = input(f"Delete instance '{name}'? This cannot be undone [y/N]: ")
-            if confirm.lower() != "y":
-                print("Cancelled")
+        # Check if running
+        if SystemdManager.get_service_status(instance) == "active":
+            if not force:
+                print(f"Error: Instance '{name}' is running. Stop it first or use --force")
                 return False
+            print(f"Stopping running instance '{name}'...")
+            self.stop_instance(name)
 
         print(f"Deleting instance '{name}'...")
 
         try:
-            SystemdManager.stop(instance)
-            SystemdManager.disable_autostart(instance)
-            SystemdManager.delete_service(instance)
-            self.ufw.delete_port(instance.port)
+            # Remove systemd service
+            SystemdManager.remove_service(instance)
 
+            # Remove state directory
             if instance.state_dir().exists():
                 shutil.rmtree(instance.state_dir())
+                print(f"  Removed: {instance.state_dir()}")
+
+            # Remove config file
             if instance.config_path().exists():
                 instance.config_path().unlink()
+                print(f"  Removed: {instance.config_path()}")
 
+            # Remove workspace link
+            workspace_link = Path.home() / ".openclaw" / f"workspace-{name}"
+            if workspace_link.exists():
+                workspace_link.unlink()
+                print(f"  Removed: {workspace_link}")
+
+            # Remove from registry
             self.registry.remove(name)
 
             print(f"✓ Instance '{name}' deleted successfully")
             return True
 
         except Exception as e:
-            print(f"Error deleting instance: {e}")
+            print(f"  Error deleting instance: {e}")
             return False
 
-    def edit_instance(self, name: str, key: str, value: str) -> bool:
-        """Edit an instance config value"""
+    def start_instance(self, name: str) -> bool:
+        """Start an OpenClaw instance"""
         instance = self.registry.get(name)
         if not instance:
             print(f"Error: Instance '{name}' not found")
             return False
 
-        try:
-            with open(instance.config_path(), "r") as f:
-                config = json.load(f)
+        print(f"Starting instance '{name}'...")
 
-            keys = key.split(".")
-            target = config
-            for k in keys[:-1]:
-                if k not in target:
-                    target[k] = {}
-                target = target[k]
-
-            try:
-                parsed_value = json.loads(value)
-            except:
-                parsed_value = value
-
-            target[keys[-1]] = parsed_value
-
-            with open(instance.config_path(), "w") as f:
-                json.dump(config, f, indent=2)
-
-            print(f"✓ Updated {key} = {value}")
-
-            status = SystemdManager.get_status(instance)
-            if status == "active":
-                print("Restarting service...")
-                SystemdManager.restart(instance)
-
+        if SystemdManager.start_service(instance):
+            instance.status = "active"
+            self.registry.add(instance)
+            print(f"✓ Instance '{name}' started")
             return True
-
-        except Exception as e:
-            print(f"Error editing instance: {e}")
+        else:
+            print(f"✗ Failed to start instance '{name}'")
             return False
 
-    def list_instances(self, verbose: bool = False):
+    def stop_instance(self, name: str) -> bool:
+        """Stop an OpenClaw instance"""
+        instance = self.registry.get(name)
+        if not instance:
+            print(f"Error: Instance '{name}' not found")
+            return False
+
+        print(f"Stopping instance '{name}'...")
+
+        if SystemdManager.stop_service(instance):
+            instance.status = "stopped"
+            self.registry.add(instance)
+            print(f"✓ Instance '{name}' stopped")
+            return True
+        else:
+            print(f"✗ Failed to stop instance '{name}'")
+            return False
+
+    def restart_instance(self, name: str) -> bool:
+        """Restart an OpenClaw instance"""
+        instance = self.registry.get(name)
+        if not instance:
+            print(f"Error: Instance '{name}' not found")
+            return False
+
+        print(f"Restarting instance '{name}'...")
+        self.stop_instance(name)
+        return self.start_instance(name)
+
+    def list_instances(self) -> None:
         """List all instances"""
         instances = self.registry.get_all()
 
@@ -959,105 +671,28 @@ class OpenClawManager:
             print("No instances found")
             return
 
-        print(
-            f"{'Instance':<15} {'Port':<8} {'Status':<10} {'Autostart':<10} {'Model'}"
-        )
+        print(f"{'Instance':<15} {'Port':<8} {'Status':<10} {'Autostart':<10} {'Model'}")
         print("-" * 70)
 
-        for name in sorted(instances.keys()):
-            inst = instances[name]
-            status = SystemdManager.get_status(inst)
-            autostart = "enabled" if inst.autostart else "disabled"
-            model = inst.model or "default"
+        for name, instance in sorted(instances.items()):
+            status = SystemdManager.get_service_status(instance)
+            autostart = "enabled" if instance.autostart else "disabled"
+            model = instance.model or "default"
+            print(f"{name:<15} {instance.port:<8} {status:<10} {autostart:<10} {model}")
 
-            print(
-                f"{inst.name:<15} {inst.port:<8} {status:<10} {autostart:<10} {model}"
-            )
-
-            if verbose:
-                print(f"  Config: {inst.config_path()}")
-                print(f"  State:  {inst.state_dir()}")
-                print(f"  Service: {inst.service_name()}")
-                print()
-
-    def start_instance(self, name: str) -> bool:
-        """Start an instance"""
-        instance = self.registry.get(name)
-        if not instance:
-            print(f"Error: Instance '{name}' not found")
-            return False
-
-        if SystemdManager.start(instance):
-            self.registry.update(instance)
-            print(f"✓ Instance '{name}' started")
-            return True
-        return False
-
-    def stop_instance(self, name: str) -> bool:
-        """Stop an instance"""
-        instance = self.registry.get(name)
-        if not instance:
-            print(f"Error: Instance '{name}' not found")
-            return False
-
-        if SystemdManager.stop(instance):
-            self.registry.update(instance)
-            print(f"✓ Instance '{name}' stopped")
-            return True
-        return False
-
-    def restart_instance(self, name: str) -> bool:
-        """Restart an instance"""
-        instance = self.registry.get(name)
-        if not instance:
-            print(f"Error: Instance '{name}' not found")
-            return False
-
-        if SystemdManager.restart(instance):
-            self.registry.update(instance)
-            print(f"✓ Instance '{name}' restarted")
-            return True
-        return False
-
-    def enable_autostart(self, name: str) -> bool:
-        """Enable autostart for instance"""
-        instance = self.registry.get(name)
-        if not instance:
-            print(f"Error: Instance '{name}' not found")
-            return False
-
-        if SystemdManager.enable_autostart(instance):
-            self.registry.update(instance)
-            print(f"✓ Autostart enabled for '{name}'")
-            return True
-        return False
-
-    def disable_autostart(self, name: str) -> bool:
-        """Disable autostart for instance"""
-        instance = self.registry.get(name)
-        if not instance:
-            print(f"Error: Instance '{name}' not found")
-            return False
-
-        if SystemdManager.disable_autostart(instance):
-            self.registry.update(instance)
-            print(f"✓ Autostart disabled for '{name}'")
-            return True
-        return False
-
-    def status_instance(self, name: str):
-        """Show detailed status"""
+    def show_status(self, name: str) -> None:
+        """Show detailed status of an instance"""
         instance = self.registry.get(name)
         if not instance:
             print(f"Error: Instance '{name}' not found")
             return
 
-        service_status = SystemdManager.get_status(instance)
+        status = SystemdManager.get_service_status(instance)
 
         print(f"\nInstance: {instance.name}")
         print(f"Port: {instance.port}")
         print(f"Profile: {instance.profile}")
-        print(f"Service Status: {service_status}")
+        print(f"Service Status: {status}")
         print(f"Autostart: {'enabled' if instance.autostart else 'disabled'}")
         print(f"Created: {instance.created_at}")
         print(f"\nPaths:")
@@ -1065,18 +700,83 @@ class OpenClawManager:
         print(f"  State:  {instance.state_dir()}")
         print(f"  Service: {instance.service_path()}")
 
-        if instance.config_path().exists():
+        if status == "active":
+            print(f"\n  Access: http://localhost:{instance.port}")
+
+    def enable_autostart(self, name: str) -> bool:
+        """Enable autostart for an instance"""
+        instance = self.registry.get(name)
+        if not instance:
+            print(f"Error: Instance '{name}' not found")
+            return False
+
+        if SystemdManager.enable_service(instance):
+            instance.autostart = True
+            self.registry.add(instance)
+            print(f"✓ Autostart enabled for '{name}'")
+            return True
+        else:
+            print(f"✗ Failed to enable autostart for '{name}'")
+            return False
+
+    def disable_autostart(self, name: str) -> bool:
+        """Disable autostart for an instance"""
+        instance = self.registry.get(name)
+        if not instance:
+            print(f"Error: Instance '{name}' not found")
+            return False
+
+        if SystemdManager.disable_service(instance):
+            instance.autostart = False
+            self.registry.add(instance)
+            print(f"✓ Autostart disabled for '{name}'")
+            return True
+        else:
+            print(f"✗ Failed to disable autostart for '{name}'")
+            return False
+
+    def edit_config(self, name: str, key: str, value: str) -> bool:
+        """Edit instance configuration"""
+        instance = self.registry.get(name)
+        if not instance:
+            print(f"Error: Instance '{name}' not found")
+            return False
+
+        try:
+            # Load config
             with open(instance.config_path(), "r") as f:
                 config = json.load(f)
 
-            if "agent" in config and "model" in config["agent"]:
-                print(f"\nModel: {config['agent']['model']}")
+            # Parse key path (e.g., "agents.defaults.model")
+            keys = key.split(".")
+            current = config
 
-            if "providers" in config:
-                print(f"\nProviders: {', '.join(config['providers'].keys())}")
+            for k in keys[:-1]:
+                if k not in current:
+                    current[k] = {}
+                current = current[k]
 
-    def logs_instance(self, name: str, follow: bool = False):
-        """Show instance logs"""
+            # Set value
+            try:
+                # Try to parse as JSON for complex values
+                current[keys[-1]] = json.loads(value)
+            except json.JSONDecodeError:
+                # Use as string
+                current[keys[-1]] = value
+
+            # Save config
+            with open(instance.config_path(), "w") as f:
+                json.dump(config, f, indent=2)
+
+            print(f"✓ Updated {key} = {value}")
+            return True
+
+        except Exception as e:
+            print(f"  Error editing config: {e}")
+            return False
+
+    def show_logs(self, name: str, follow: bool = False) -> None:
+        """Show logs for an instance"""
         instance = self.registry.get(name)
         if not instance:
             print(f"Error: Instance '{name}' not found")
@@ -1086,270 +786,237 @@ class OpenClawManager:
         if follow:
             cmd.append("-f")
         else:
-            cmd.extend(["-n", "100"])
+            cmd.extend(["-n", "50"])
 
         try:
             subprocess.run(cmd)
         except KeyboardInterrupt:
             pass
 
-    def health_check(self):
-        """Health check all instances"""
-        instances = self.registry.get_all()
-
-        print("\nHealth Check:")
-        print("-" * 50)
-
-        for name in sorted(instances.keys()):
-            inst = instances[name]
-            status = SystemdManager.get_status(inst)
-
-            if status == "active":
-                print(f"✓ {name}: healthy (port {inst.port})")
-            else:
-                print(f"✗ {name}: {status} (port {inst.port})")
-
-    def backup_instance(self, name: str, output: Optional[str] = None) -> bool:
-        """Backup instance to archive"""
-        instance = self.registry.get(name)
-        if not instance:
-            print(f"Error: Instance '{name}' not found")
-            return False
-
-        if output is None:
-            backup_dir = Path.home() / "openclaw-backups"
-            backup_dir.mkdir(exist_ok=True)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output = str(backup_dir / f"{name}-{timestamp}.tar.gz")
-
-        print(f"Backing up instance '{name}' to {output}...")
-
-        try:
-            import tarfile
-
-            with tarfile.open(output, "w:gz") as tar:
-                if instance.state_dir().exists():
-                    tar.add(instance.state_dir(), arcname=f"state")
-
-                if instance.config_path().exists():
-                    tar.add(instance.config_path(), arcname="config.json")
-
-                if instance.service_path().exists():
-                    tar.add(instance.service_path(), arcname="service")
-
-                metadata = {
-                    "name": instance.name,
-                    "port": instance.port,
-                    "profile": instance.profile,
-                    "model": instance.model,
-                    "created_at": instance.created_at,
-                    "backup_date": datetime.now().isoformat(),
-                }
-                import io
-
-                metadata_bytes = json.dumps(metadata, indent=2).encode()
-                metadata_info = tarfile.TarInfo(name="metadata.json")
-                metadata_info.size = len(metadata_bytes)
-                tar.addfile(metadata_info, io.BytesIO(metadata_bytes))
-
-            print(f"✓ Backup created: {output}")
-            print(f"  Size: {Path(output).stat().st_size / 1024:.1f} KB")
-            return True
-
-        except Exception as e:
-            print(f"Error creating backup: {e}")
-            return False
-
-    def restore_instance(
-        self, archive: str, name: Optional[str] = None, force: bool = False
-    ) -> bool:
-        """Restore instance from archive"""
-        archive_path = Path(archive)
-        if not archive_path.exists():
-            print(f"Error: Archive not found: {archive}")
-            return False
-
-        try:
-            import tarfile
-
-            with tarfile.open(archive, "r:gz") as tar:
-                metadata_file = tar.extractfile("metadata.json")
-                if metadata_file:
-                    metadata = json.load(metadata_file)
-                    orig_name = metadata.get("name", "unknown")
-                    orig_port = metadata.get("port", BASE_PORT)
-                else:
-                    print("Error: Invalid backup archive (no metadata)")
-                    return False
-
-                restore_name = name if name else orig_name
-
-                if self.registry.get(restore_name) and not force:
-                    print(
-                        f"Error: Instance '{restore_name}' already exists. Use --force to overwrite."
-                    )
-                    return False
-
-                print(f"Restoring instance '{restore_name}' from {archive}...")
-
-                if force and self.registry.get(restore_name):
-                    self.delete_instance(restore_name, force=True)
-
-                port = self.registry.next_port()
-                instance = Instance(
-                    name=restore_name,
-                    port=port,
-                    profile=restore_name,
-                    created_at=datetime.now().isoformat(),
-                    model=metadata.get("model", ""),
-                )
-
-                instance.state_dir().mkdir(parents=True, exist_ok=True)
-
-                temp_extract = (
-                    instance.state_dir().parent / f"temp_restore_{restore_name}"
-                )
-                temp_extract.mkdir(exist_ok=True)
-
-                state_members = [
-                    m for m in tar.getmembers() if m.name.startswith("state/")
-                ]
-                for member in state_members:
-                    tar.extract(member, path=temp_extract)
-
-                extracted = temp_extract / "state"
-                if extracted.exists():
-                    for item in extracted.iterdir():
-                        dest = instance.state_dir() / item.name
-                        if item.is_dir():
-                            shutil.copytree(item, dest, dirs_exist_ok=True)
-                        else:
-                            shutil.copy2(item, dest)
-                    shutil.rmtree(temp_extract)
-
-                for member in tar.getmembers():
-                    if member.name == "config.json":
-                        config_file = tar.extractfile(member)
-                        if config_file:
-                            config = json.load(config_file)
-                            config["gateway"]["port"] = port
-                            with open(instance.config_path(), "w") as f:
-                                json.dump(config, f, indent=2)
-                        break
-
-                SystemdManager.create_service(instance)
-                self.registry.add(instance)
-
-                print(f"✓ Instance '{restore_name}' restored successfully")
-                print(f"  Port: {port}")
-                print(f"  Config: {instance.config_path()}")
-                print(f"  State: {instance.state_dir()}")
-
-                return True
-
-        except Exception as e:
-            print(f"Error restoring backup: {e}")
-            return False
-
     def use_instance(self, name: str, args: List[str]) -> bool:
-        """Run openclaw command within an instance's context"""
+        """Run openclaw command with instance profile"""
         instance = self.registry.get(name)
         if not instance:
             print(f"Error: Instance '{name}' not found")
             return False
 
-        env = os.environ.copy()
-        env["OPENCLAW_PROFILE"] = instance.profile
-        env["OPENCLAW_CONFIG_PATH"] = str(instance.config_path())
-        env["OPENCLAW_STATE_DIR"] = str(instance.state_dir())
-        env["OPENCLAW_GATEWAY_PORT"] = str(instance.port)
+        # Check if running
+        if SystemdManager.get_service_status(instance) != "active":
+            print(f"Error: Instance '{name}' is not running")
+            print(f"Start it with: ocm start {name}")
+            return False
 
-        cmd = [str(OPENCLAW_BIN)] + args
-
-        print(f"Running in context of '{name}': {' '.join(cmd)}")
-        print(f"  Profile: {instance.profile}")
-        print(f"  Config: {instance.config_path()}")
-        print(f"  State: {instance.state_dir()}")
-        print("-" * 50)
+        # Build command
+        cmd = [str(OPENCLAW_BIN), f"--profile={name}"] + args
 
         try:
-            result = subprocess.run(
-                cmd,
-                env=env,
-                cwd=str(instance.workspace()),
-            )
+            result = subprocess.run(cmd)
             return result.returncode == 0
         except Exception as e:
             print(f"Error running command: {e}")
             return False
 
-    def use_interactive(self) -> bool:
-        """Enter interactive mode for selected instance"""
-        instances = self.registry.get_all()
-
-        if not instances:
-            print("No instances found")
-            return False
-
-        print("\nSelect an instance:")
-        print("-" * 50)
-        for i, inst_name in enumerate(sorted(instances.keys()), 1):
-            status = SystemdManager.get_status(instances[inst_name])
-            print(f"  {i}) {inst_name} (port {instances[inst_name].port}) [{status}]")
-
-        print(f"\n  0) Cancel")
-
-        try:
-            choice = input("Enter selection: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nCancelled")
-            return False
-
-        if choice == "0" or choice == "":
-            print("Cancelled")
-            return False
-
-        try:
-            idx = int(choice)
-            if idx < 1 or idx > len(instances):
-                print(f"Invalid selection: {choice}")
-                return False
-            name = sorted(instances.keys())[idx - 1]
-        except ValueError:
-            if choice not in instances:
-                print(f"Instance '{choice}' not found")
-                return False
-            name = choice
-
-        return self.enter_instance_shell(name)
-
     def enter_instance_shell(self, name: str) -> bool:
-        """Enter interactive shell for an instance"""
+        """Enter interactive shell for instance"""
         instance = self.registry.get(name)
         if not instance:
             print(f"Error: Instance '{name}' not found")
             return False
 
-        print(f"\nEntering interactive mode for '{name}'")
-        print("Type 'exit' to quit, 'help' for commands")
-        print("-" * 50)
+        # Check if running
+        if SystemdManager.get_service_status(instance) != "active":
+            print(f"Error: Instance '{name}' is not running")
+            print(f"Start it with: ocm start {name}")
+            return False
 
+        print(f"Entering interactive shell for '{name}'...")
+        print(f"Profile: {name}")
+        print(f"Port: {instance.port}")
+        print(f"Workspace: {instance.workspace()}")
+        print("")
+        print("Available commands:")
+        print(f"  openclaw --profile {name} <command>")
+        print("")
+
+        # Set up environment
         env = os.environ.copy()
-        env["OPENCLAW_PROFILE"] = instance.profile
-        env["OPENCLAW_CONFIG_PATH"] = str(instance.config_path())
-        env["OPENCLAW_STATE_DIR"] = str(instance.state_dir())
+        env["OPENCLAW_PROFILE"] = name
         env["OPENCLAW_GATEWAY_PORT"] = str(instance.port)
 
+        # Start shell
+        shell = os.environ.get("SHELL", "/bin/bash")
         try:
             subprocess.run(
-                ["/bin/bash", "--norc", "--noprofile"],
-                env=env,
+                [shell],
                 cwd=str(instance.workspace()),
+                env=env,
             )
-        except KeyboardInterrupt:
-            pass
+            return True
+        except Exception as e:
+            print(f"Error starting shell: {e}")
+            return False
 
-        return True
+    def health_check(self) -> None:
+        """Check health of all instances"""
+        instances = self.registry.get_all()
+
+        if not instances:
+            print("No instances to check")
+            return
+
+        print("\nHealth Check:")
+        print("-" * 50)
+
+        for name, instance in sorted(instances.items()):
+            status = SystemdManager.get_service_status(instance)
+
+            if status == "active":
+                # Try to connect to port
+                import socket
+
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(2)
+                    result = sock.connect_ex(("localhost", instance.port))
+                    sock.close()
+
+                    if result == 0:
+                        print(f"✓ {name}: healthy (port {instance.port})")
+                    else:
+                        print(f"⚠ {name}: running but port {instance.port} not responding")
+                except Exception as e:
+                    print(f"⚠ {name}: error checking port - {e}")
+            else:
+                print(f"✗ {name}: not running (expected: port {instance.port})")
+
+    def deploy_instance(self, name: str, model: Optional[str] = None) -> bool:
+        """One-step deployment: create, start, and verify an instance"""
+        print(f"Deploying instance '{name}'...")
+        print()
+
+        # Step 1: Create
+        if not self.create_instance(name, model, autostart=True):
+            print("\n✗ Deployment failed at creation step")
+            return False
+
+        print()
+
+        # Step 2: Start
+        if not self.start_instance(name):
+            print("\n✗ Deployment failed at start step")
+            return False
+
+        # Step 3: Wait for service
+        print("Waiting for service to be ready...")
+        import time
+
+        for i in range(10):
+            time.sleep(1)
+            status = SystemdManager.get_service_status(self.registry.get(name))
+            if status == "active":
+                break
+
+        # Step 4: Verify
+        print("\nVerifying deployment...")
+        self.health_check()
+
+        instance = self.registry.get(name)
+        if instance and SystemdManager.get_service_status(instance) == "active":
+            print(f"\n✓ Instance '{name}' deployed successfully!")
+            print(f"  Access: http://localhost:{instance.port}")
+            print(f"  Profile: {name}")
+            return True
+        else:
+            print(f"\n⚠ Instance '{name}' created but may not be fully ready")
+            print(f"  Check status with: ocm status {name}")
+            return False
+
+
+class PPQModelUpdater:
+    """Updates model configurations from PPQ AI API"""
+
+    API_URL = "https://api.ppq.ai/v1/models"
+
+    @classmethod
+    def fetch_models(cls) -> Optional[dict]:
+        """Fetch available models from PPQ AI"""
+        print("Fetching models from PPQ AI...")
+
+        try:
+            # Create SSL context that doesn't verify certificates (for compatibility)
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+
+            req = urllib.request.Request(
+                cls.API_URL,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "OCM/1.0",
+                },
+            )
+
+            with urllib.request.urlopen(req, context=ssl_context, timeout=30) as response:
+                data = json.loads(response.read().decode("utf-8"))
+                return data
+
+        except Exception as e:
+            print(f"  Error fetching models: {e}")
+            return None
+
+    @classmethod
+    def update_main_config(cls) -> bool:
+        """Update main instance config with PPQ models"""
+        models_data = cls.fetch_models()
+        if not models_data:
+            return False
+
+        main_config_path = Path.home() / ".openclaw" / "openclaw.json"
+
+        try:
+            # Load existing config
+            if main_config_path.exists():
+                with open(main_config_path, "r") as f:
+                    config = json.load(f)
+            else:
+                config = {}
+
+            # Update models section
+            if "models" not in config:
+                config["models"] = {}
+
+            # Add PPQ provider models
+            config["models"]["providers"] = {
+                "custom-api-ppq-ai": {
+                    "baseUrl": "https://api.ppq.ai",
+                    "apiKey": "${PPQ_API_KEY}",
+                    "api": "openai-completions",
+                    "models": [],
+                }
+            }
+
+            # Parse and add models
+            if "data" in models_data:
+                for model in models_data["data"]:
+                    model_entry = {
+                        "id": model.get("id", ""),
+                        "name": model.get("name", ""),
+                        "contextWindow": model.get("context_length", 8192),
+                    }
+                    config["models"]["providers"]["custom-api-ppq-ai"][
+                        "models"
+                    ].append(model_entry)
+
+            # Save config
+            with open(main_config_path, "w") as f:
+                json.dump(config, f, indent=2)
+
+            print(f"✓ Updated {len(models_data.get('data', []))} models in {main_config_path}")
+            return True
+
+        except Exception as e:
+            print(f"  Error updating config: {e}")
+            return False
 
 
 def main():
@@ -1359,70 +1026,67 @@ def main():
         epilog="""
 Examples:
   # Quick deploy (create + start + test)
-  %(prog)s deploy worker1
-  %(prog)s deploy worker2 --model custom-api-ppq-ai/gpt-5.1
+  ocm deploy worker1
+  ocm deploy worker2 --model custom-api-ppq-ai/gpt-5.1
 
   # Create new instance
-  %(prog)s create worker1
+  ocm create worker1
 
   # Create with specific model
-  %(prog)s create worker2 --model openai/gpt-4
+  ocm create worker2 --model openai/gpt-4
 
   # List all instances
-  %(prog)s list
+  ocm list
 
   # Start/stop instance
-  %(prog)s start worker1
-  %(prog)s stop worker1
+  ocm start worker1
+  ocm stop worker1
 
   # Enable autostart
-  %(prog)s enable worker1
+  ocm enable worker1
 
   # Edit config
-  %(prog)s edit worker1 agent.model openai/gpt-4
+  ocm edit worker1 agent.model openai/gpt-4
 
   # Delete instance
-  %(prog)s delete worker1 --force
+  ocm delete worker1 --force
 
   # Run openclaw command in instance context
-  %(prog)s use worker1 agent --agent main --message "Hello"
+  ocm use worker1 agent --agent main --message "Hello"
+
+  # Interactive shell
+  ocm enter worker1
         """,
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
+    # Deploy (one-step create + start + verify)
+    deploy_parser = subparsers.add_parser(
+        "deploy", help="Create, start, and verify an instance (one-step deployment)"
+    )
+    deploy_parser.add_argument("name", help="Instance name")
+    deploy_parser.add_argument("--model", help="Primary model to use")
+
     # Create
     create_parser = subparsers.add_parser("create", help="Create new instance")
     create_parser.add_argument("name", help="Instance name")
+    create_parser.add_argument("--model", help="Primary model to use")
     create_parser.add_argument(
-        "--port", type=int, help="Custom port (auto-assigned if not specified)"
+        "--autostart", action="store_true", help="Enable autostart"
     )
-    create_parser.add_argument("--model", help="Default model for instance")
 
     # Delete
     delete_parser = subparsers.add_parser("delete", help="Delete instance")
     delete_parser.add_argument("name", help="Instance name")
-    delete_parser.add_argument("--force", action="store_true", help="Skip confirmation")
-
-    # Edit
-    edit_parser = subparsers.add_parser("edit", help="Edit instance config")
-    edit_parser.add_argument("name", help="Instance name")
-    edit_parser.add_argument("key", help="Config key (dot notation, e.g., agent.model)")
-    edit_parser.add_argument("value", help="Config value")
+    delete_parser.add_argument("--force", action="store_true", help="Force delete if running")
 
     # List
-    list_parser = subparsers.add_parser("list", help="List instances")
-    list_parser.add_argument(
-        "--verbose", "-v", action="store_true", help="Verbose output"
-    )
+    subparsers.add_parser("list", help="List all instances")
 
     # Start/Stop/Restart
-    subparsers.add_parser("start", help="Start instance").add_argument(
-        "name", help="Instance name"
-    )
-    subparsers.add_parser("stop", help="Stop instance").add_argument(
-        "name", help="Instance name"
-    )
+    subparsers.add_parser("start", help="Start instance").add_argument("name", help="Instance name")
+    subparsers.add_parser("stop", help="Stop instance").add_argument("name", help="Instance name")
     subparsers.add_parser("restart", help="Restart instance").add_argument(
         "name", help="Instance name"
     )
@@ -1436,119 +1100,92 @@ Examples:
     )
 
     # Status
-    subparsers.add_parser("status", help="Show instance status").add_argument(
-        "name", help="Instance name"
-    )
+    status_parser = subparsers.add_parser("status", help="Show instance status")
+    status_parser.add_argument("name", help="Instance name")
 
     # Logs
     logs_parser = subparsers.add_parser("logs", help="Show instance logs")
     logs_parser.add_argument("name", help="Instance name")
-    logs_parser.add_argument(
-        "--follow", "-f", action="store_true", help="Follow log output"
-    )
+    logs_parser.add_argument("-f", "--follow", action="store_true", help="Follow logs")
 
-    # Health
+    # Health check
     subparsers.add_parser("health", help="Health check all instances")
 
-    # Update-models
-    subparsers.add_parser("update-models", help="Fetch and update models from PPQ AI")
-
-    # Backup/Restore
-    backup_parser = subparsers.add_parser("backup", help="Backup instance to archive")
-    backup_parser.add_argument("name", help="Instance name")
-    backup_parser.add_argument(
-        "--output",
-        "-o",
-        help="Output file path (default: ~/openclaw-backups/<name>-<timestamp>.tar.gz)",
-    )
-
-    restore_parser = subparsers.add_parser(
-        "restore", help="Restore instance from archive"
-    )
-    restore_parser.add_argument("archive", help="Backup archive path")
-    restore_parser.add_argument(
-        "--name", "-n", help="New instance name (default: from archive)"
-    )
-    restore_parser.add_argument(
-        "--force", action="store_true", help="Overwrite if instance exists"
-    )
+    # Edit
+    edit_parser = subparsers.add_parser("edit", help="Edit instance config")
+    edit_parser.add_argument("name", help="Instance name")
+    edit_parser.add_argument("key", help="Config key (e.g., agents.defaults.model)")
+    edit_parser.add_argument("value", help="Config value")
 
     # Use
     use_parser = subparsers.add_parser(
         "use", help="Run openclaw command in instance context"
     )
     use_parser.add_argument("name", help="Instance name")
-    use_parser.add_argument("cmd_args", nargs="...", help="OpenClaw command and args")
+    use_parser.add_argument("args", nargs=argparse.REMAINDER, help="Command arguments")
 
     # Enter
-    subparsers.add_parser("enter", help="Enter interactive shell for instance")
+    enter_parser = subparsers.add_parser("enter", help="Enter interactive shell for instance")
+    enter_parser.add_argument("name", help="Instance name")
 
-    # Deploy
-    deploy_parser = subparsers.add_parser(
-        "deploy", help="Create, start, and verify an instance (one-step deployment)"
-    )
-    deploy_parser.add_argument("name", help="Instance name")
-    deploy_parser.add_argument(
-        "--port", type=int, help="Custom port (auto-assigned if not specified)"
-    )
-    deploy_parser.add_argument("--model", help="Default model for instance")
-    deploy_parser.add_argument(
-        "--test",
-        action="store_true",
-        default=True,
-        help="Run health check after start (default: True)",
-    )
+    # Update models
+    subparsers.add_parser("update-models", help="Fetch and update models from PPQ AI")
 
     args = parser.parse_args()
 
     if not args.command:
         parser.print_help()
-        sys.exit(1)
+        return
 
     manager = OpenClawManager()
 
-    if args.command == "use":
-        cmd_args = list(args.cmd_args) if args.cmd_args else []
-        success = manager.use_instance(args.name, cmd_args)
-        sys.exit(0 if success else 1)
-    elif args.command == "enter":
-        success = manager.use_interactive()
-        sys.exit(0 if success else 1)
-    elif args.command == "update-models":
-        success = manager.update_models()
-        sys.exit(0 if success else 1)
-    else:
-        commands = {
-            "create": lambda: manager.create_instance(args.name, args.port, args.model),
-            "delete": lambda: manager.delete_instance(args.name, args.force),
-            "edit": lambda: manager.edit_instance(args.name, args.key, args.value),
-            "list": lambda: manager.list_instances(args.verbose),
-            "start": lambda: manager.start_instance(args.name),
-            "stop": lambda: manager.stop_instance(args.name),
-            "restart": lambda: manager.restart_instance(args.name),
-            "enable": lambda: manager.enable_autostart(args.name),
-            "disable": lambda: manager.disable_autostart(args.name),
-            "status": lambda: manager.status_instance(args.name),
-            "logs": lambda: manager.logs_instance(args.name, args.follow),
-            "health": lambda: manager.health_check(),
-            "backup": lambda: manager.backup_instance(args.name, args.output),
-            "restore": lambda: manager.restore_instance(
-                args.archive, args.name, args.force
-            ),
-        }
+    if args.command == "deploy":
+        manager.deploy_instance(args.name, args.model)
 
-        # Handle deploy command separately since it needs multiple steps
-        if args.command == "deploy":
-            success = manager.deploy_instance(
-                args.name, args.port, args.model, args.test
-            )
-            sys.exit(0 if success else 1)
-        elif args.command in commands:
-            success = commands[args.command]()
-            sys.exit(0 if success else 1)
-        else:
-            parser.print_help()
-            sys.exit(1)
+    elif args.command == "create":
+        manager.create_instance(args.name, args.model, args.autostart)
+
+    elif args.command == "delete":
+        manager.delete_instance(args.name, args.force)
+
+    elif args.command == "list":
+        manager.list_instances()
+
+    elif args.command == "start":
+        manager.start_instance(args.name)
+
+    elif args.command == "stop":
+        manager.stop_instance(args.name)
+
+    elif args.command == "restart":
+        manager.restart_instance(args.name)
+
+    elif args.command == "enable":
+        manager.enable_autostart(args.name)
+
+    elif args.command == "disable":
+        manager.disable_autostart(args.name)
+
+    elif args.command == "status":
+        manager.show_status(args.name)
+
+    elif args.command == "logs":
+        manager.show_logs(args.name, args.follow)
+
+    elif args.command == "health":
+        manager.health_check()
+
+    elif args.command == "edit":
+        manager.edit_config(args.name, args.key, args.value)
+
+    elif args.command == "use":
+        manager.use_instance(args.name, args.args)
+
+    elif args.command == "enter":
+        manager.enter_instance_shell(args.name)
+
+    elif args.command == "update-models":
+        PPQModelUpdater.update_main_config()
 
 
 if __name__ == "__main__":
