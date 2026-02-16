@@ -11,6 +11,7 @@ A CLI tool for managing isolated OpenClaw instances using profile-based isolatio
 - **Config inheritance** - Inherits providers, API keys, and models from main instance
 - **Backup/Restore** - Full instance backup with restore capability
 - **Instance shell** - Run openclaw commands in instance context with `use` command
+- **Model sync** - Fetch available models from PPQ AI API
 
 ## Requirements
 
@@ -37,6 +38,11 @@ Run OCM directly:
 Or with Python:
 ```bash
 python3 ocm.py <command> [arguments]
+```
+
+### Update Models from PPQ AI
+```bash
+./ocm.py update-models    # Fetch all available models and update config
 ```
 
 ### Create Instance
@@ -88,6 +94,7 @@ python3 ocm.py <command> [arguments]
 | `status <name>` | Show instance status |
 | `logs <name>` | View instance logs |
 | `health` | Health check all |
+| `update-models` | Fetch models from PPQ AI API |
 | `backup <name>` | Backup instance |
 | `restore <archive>` | Restore from archive |
 | `use <name> <cmd>` | Run openclaw command |
