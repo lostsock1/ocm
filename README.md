@@ -24,44 +24,52 @@ A CLI tool for managing isolated OpenClaw instances using profile-based isolatio
 ```bash
 git clone https://github.com/lostsock1/ocm.git
 cd ocm
-chmod +x openclaw_manager.py
-./openclaw_manager.py install-aliases
-source ~/.bashrc
+chmod +x ocm.py
 ```
 
 ## Usage
 
+Run OCM directly:
+```bash
+./ocm.py <command> [arguments]
+```
+
+Or with Python:
+```bash
+python3 ocm.py <command> [arguments]
+```
+
 ### Create Instance
 ```bash
-ocm create worker1 --model minimax/minimax-m2.5
+./ocm.py create worker1 --model minimax/minimax-m2.5
 ```
 
 ### Manage Instance
 ```bash
-ocm start worker1     # Start instance
-ocm stop worker1      # Stop instance
-ocm restart worker1   # Restart instance
-ocm status worker1    # Show detailed status
-ocm logs worker1      # View logs
-ocm health            # Health check all instances
+./ocm.py start worker1     # Start instance
+./ocm.py stop worker1      # Stop instance
+./ocm.py restart worker1   # Restart instance
+./ocm.py status worker1    # Show detailed status
+./ocm.py logs worker1      # View logs
+./ocm.py health            # Health check all instances
 ```
 
 ### Run OpenClaw Commands in Instance Context
 ```bash
-ocm use worker1 health              # Run health check
-ocm use worker1 status              # Get status
-ocm use worker1 logs --follow       # Follow logs
+./ocm.py use worker1 health              # Run health check
+./ocm.py use worker1 status              # Get status
+./ocm.py use worker1 logs --follow       # Follow logs
 ```
 
 ### Enter Interactive Shell
 ```bash
-ocm enter  # Select instance and open shell
+./ocm.py enter  # Select instance and open shell
 ```
 
 ### Backup and Restore
 ```bash
-ocm backup worker1                           # Backup to default location
-ocm restore ~/backups/mybackup.tar.gz        # Restore from archive
+./ocm.py backup worker1                           # Backup to default location
+./ocm.py restore ~/backups/mybackup.tar.gz        # Restore from archive
 ```
 
 ## Commands
@@ -84,7 +92,6 @@ ocm restore ~/backups/mybackup.tar.gz        # Restore from archive
 | `restore <archive>` | Restore from archive |
 | `use <name> <cmd>` | Run openclaw command |
 | `enter` | Interactive shell |
-| `install-aliases` | Install shell aliases |
 
 ## License
 
