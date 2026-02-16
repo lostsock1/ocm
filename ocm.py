@@ -94,6 +94,8 @@ class Registry:
     def _save(self):
         with open(REGISTRY_FILE, "w") as f:
             json.dump(self._data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
 
     def get_all(self) -> Dict[str, Instance]:
         return {k: Instance.from_dict(v) for k, v in self._data["instances"].items()}
