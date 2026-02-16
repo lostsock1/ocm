@@ -13,6 +13,8 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.request
+import ssl
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -172,8 +174,6 @@ class UFWManager:
     def delete_port(port: int) -> bool:
         """Remove UFW rule for port"""
         try:
-            # Delete rules by port - ufw will handle both IPv4 and IPv6
-            # Using 'delete allow' syntax without confirmation
             subprocess.run(
                 ["sudo", "ufw", "delete", "allow", str(port)],
                 capture_output=True,
@@ -201,14 +201,12 @@ class UFWManager:
 class ConfigInheritor:
     """Handles configuration inheritance from main instance"""
 
-    # Keys to inherit from main config
     INHERIT_KEYS = [
         "agent.model",
         "providers",
-        "models",  # Custom model definitions
+        "models",
     ]
 
-    # Keys to explicitly exclude (even if nested)
     EXCLUDE_PATTERNS = [
         "tailscale",
         "gateway.tailscale",
@@ -229,18 +227,15 @@ class ConfigInheritor:
         """Extract only inheritable settings"""
         inherited = {}
 
-        # Copy agents.defaults (model config, workspace settings)
         if "agents" in config and "defaults" in config["agents"]:
             defaults = config["agents"]["defaults"]
             inherited["agents"] = {"defaults": {}}
 
-            # Copy model configuration
             if "model" in defaults:
                 inherited["agents"]["defaults"]["model"] = defaults["model"]
             if "models" in defaults:
                 inherited["agents"]["defaults"]["models"] = defaults["models"]
 
-        # Copy providers (excluding tailscale-related)
         if "providers" in config:
             inherited["providers"] = {}
             for provider_name, provider_config in config["providers"].items():
@@ -251,7 +246,6 @@ class ConfigInheritor:
                         if k in ["baseURL", "apiKey", "models", "baseUrl", "api"]
                     }
 
-        # Copy models if defined
         if "models" in config:
             inherited["models"] = config["models"]
 
@@ -263,7 +257,6 @@ class ConfigInheritor:
         main_config = cls.load_main_config()
         inherited = cls.extract_inheritable(main_config)
 
-        # Base config for new instance
         new_config = {
             "meta": {
                 "lastTouchedVersion": "2026.2.15",
@@ -285,16 +278,14 @@ class ConfigInheritor:
             },
         }
 
-        # Merge inherited settings
         new_config.update(inherited)
 
-        # Remove deprecated keys if modern format is present
         if "agent" in new_config and "agents" in new_config:
             if (
                 "defaults" in new_config["agents"]
                 and "model" in new_config["agents"]["defaults"]
             ):
-                del new_config["agent"]  # Remove deprecated agent.*
+                del new_config["agent"]
 
         return new_config
 
@@ -363,7 +354,6 @@ WantedBy=default.target
             with open(instance.service_path(), "w") as f:
                 f.write(service_content)
 
-            # Reload systemd
             subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
             return True
         except Exception as e:
@@ -468,12 +458,104 @@ class OpenClawManager:
         self.registry = Registry()
         self.ufw = UFWManager()
 
+    def update_models(self) -> bool:
+        """Fetch models from PPQ AI and update main openclaw.json config"""
+        config_path = Path.home() / ".openclaw" / "openclaw.json"
+
+        try:
+            with open(config_path, "r") as f:
+                config = json.load(f)
+        except FileNotFoundError:
+            print(f"Error: Config not found at {config_path}")
+            return False
+        except json.JSONDecodeError as e:
+            print(f"Error: Invalid JSON in config: {e}")
+            return False
+
+        print("Fetching models from PPQ AI...")
+
+        try:
+            ssl_context = ssl.create_default_context()
+            req = urllib.request.Request(
+                "https://api.ppq.ai/v1/models",
+                headers={"Accept": "application/json"}
+            )
+
+            with urllib.request.urlopen(req, context=ssl_context, timeout=30) as response:
+                data = json.loads(response.read().decode('utf-8'))
+        except Exception as e:
+            print(f"Error fetching models: {e}")
+            return False
+
+        if 'data' not in data or not isinstance(data['data'], list):
+            print("Error: Unexpected API response format")
+            return False
+
+        api_key = None
+        if 'models' in config and 'providers' in config['models']:
+            for provider_name, provider_config in config['models']['providers'].items():
+                if 'apiKey' in provider_config:
+                    api_key = provider_config['apiKey']
+                    break
+
+        if not api_key:
+            print("Warning: No existing API key found in config")
+
+        models = []
+        for model in data['data']:
+            model_entry = {
+                'id': model['id'],
+                'name': f"{model.get('name', model['id'])} ({model.get('provider', 'Unknown')})",
+                'reasoning': model.get('id', '').startswith(('claude-opus', 'claude-sonnet', 'gpt-5')),
+                'input': ['text'],
+                'cost': {
+                    'input': model.get('pricing', {}).get('api', {}).get('input_per_1M', 0),
+                    'output': model.get('pricing', {}).get('api', {}).get('output_per_1M', 0),
+                    'cacheRead': 0,
+                    'cacheWrite': 0
+                },
+                'contextWindow': model.get('context_length', 128000),
+                'maxTokens': min(16384, model.get('context_length', 16384))
+            }
+            models.append(model_entry)
+
+        print(f"Found {len(models)} models")
+
+        if 'models' not in config:
+            config['models'] = {}
+
+        config['models']['mode'] = 'merge'
+        config['models']['providers'] = {
+            'custom-api-ppq-ai': {
+                'baseUrl': 'https://api.ppq.ai',
+                'apiKey': api_key or '',
+                'api': 'openai-completions',
+                'models': models
+            }
+        }
+
+        backup_path = Path.home() / ".openclaw" / f"openclaw.json.bak.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        try:
+            shutil.copy2(config_path, backup_path)
+            print(f"Backup created: {backup_path}")
+        except Exception as e:
+            print(f"Warning: Could not create backup: {e}")
+
+        try:
+            with open(config_path, "w") as f:
+                json.dump(config, f, indent=4)
+            print(f"✓ Models updated in {config_path}")
+            print(f"  Added {len(models)} models from PPQ AI")
+            return True
+        except Exception as e:
+            print(f"Error saving config: {e}")
+            return False
+
     def create_instance(
         self, name: str, port: Optional[int] = None, model: Optional[str] = None
     ) -> bool:
         """Create a new OpenClaw instance"""
 
-        # Validate name
         if not re.match(r"^[a-zA-Z0-9_-]+$", name):
             print(
                 f"Error: Invalid instance name '{name}'. Use only alphanumeric, hyphens, and underscores."
@@ -488,7 +570,6 @@ class OpenClawManager:
             print(f"Error: Instance '{name}' already exists")
             return False
 
-        # Determine port
         if port is None:
             port = self.registry.next_port()
         elif self.registry.port_in_use(port):
@@ -497,7 +578,6 @@ class OpenClawManager:
 
         print(f"Creating instance '{name}' on port {port}...")
 
-        # Create directories
         instance = Instance(
             name=name,
             port=port,
@@ -507,7 +587,6 @@ class OpenClawManager:
         )
 
         try:
-            # Create state directory structure
             instance.state_dir().mkdir(parents=True, exist_ok=True)
             (instance.state_dir() / "workspace").mkdir(exist_ok=True)
             (instance.state_dir() / "agents").mkdir(exist_ok=True)
@@ -515,10 +594,8 @@ class OpenClawManager:
             (instance.state_dir() / "agents" / "main" / "sessions").mkdir(exist_ok=True)
             (instance.state_dir() / "credentials").mkdir(exist_ok=True)
 
-            # Create config
             config = ConfigInheritor.create_instance_config(name, port)
             if model:
-                # Set model in new format
                 if "agents" not in config:
                     config["agents"] = {"defaults": {}}
                 if "defaults" not in config["agents"]:
@@ -529,15 +606,12 @@ class OpenClawManager:
             with open(instance.config_path(), "w") as f:
                 json.dump(config, f, indent=2)
 
-            # Create systemd service
             if not SystemdManager.create_service(instance):
                 raise Exception("Failed to create systemd service")
 
-            # Add UFW rule
             if self.ufw.is_enabled():
                 self.ufw.allow_port(port, name)
 
-            # Register instance
             self.registry.add(instance)
 
             print(f"✓ Instance '{name}' created successfully")
@@ -550,7 +624,6 @@ class OpenClawManager:
 
         except Exception as e:
             print(f"Error creating instance: {e}")
-            # Cleanup on failure
             self._cleanup_partial(instance)
             return False
 
@@ -561,6 +634,8 @@ class OpenClawManager:
                 shutil.rmtree(instance.state_dir())
             if instance.config_path().exists():
                 instance.config_path().unlink()
+            if instance.service_path().exists():
+                instance.service_path().unlink()
         except:
             pass
 
@@ -584,25 +659,16 @@ class OpenClawManager:
         print(f"Deleting instance '{name}'...")
 
         try:
-            # Stop service if running
             SystemdManager.stop(instance)
-
-            # Disable autostart
             SystemdManager.disable_autostart(instance)
-
-            # Delete service file
             SystemdManager.delete_service(instance)
-
-            # Remove UFW rule
             self.ufw.delete_port(instance.port)
 
-            # Remove directories
             if instance.state_dir().exists():
                 shutil.rmtree(instance.state_dir())
             if instance.config_path().exists():
                 instance.config_path().unlink()
 
-            # Remove from registry
             self.registry.remove(name)
 
             print(f"✓ Instance '{name}' deleted successfully")
@@ -620,11 +686,9 @@ class OpenClawManager:
             return False
 
         try:
-            # Load config
             with open(instance.config_path(), "r") as f:
                 config = json.load(f)
 
-            # Set nested key (e.g., "agent.model")
             keys = key.split(".")
             target = config
             for k in keys[:-1]:
@@ -632,7 +696,6 @@ class OpenClawManager:
                     target[k] = {}
                 target = target[k]
 
-            # Try to parse value as JSON
             try:
                 parsed_value = json.loads(value)
             except:
@@ -640,13 +703,11 @@ class OpenClawManager:
 
             target[keys[-1]] = parsed_value
 
-            # Save config
             with open(instance.config_path(), "w") as f:
                 json.dump(config, f, indent=2)
 
             print(f"✓ Updated {key} = {value}")
 
-            # Restart if running
             status = SystemdManager.get_status(instance)
             if status == "active":
                 print("Restarting service...")
@@ -772,7 +833,6 @@ class OpenClawManager:
         print(f"  State:  {instance.state_dir()}")
         print(f"  Service: {instance.service_path()}")
 
-        # Show config summary
         if instance.config_path().exists():
             with open(instance.config_path(), "r") as f:
                 config = json.load(f)
@@ -824,7 +884,6 @@ class OpenClawManager:
             print(f"Error: Instance '{name}' not found")
             return False
 
-        # Determine output path
         if output is None:
             backup_dir = Path.home() / "openclaw-backups"
             backup_dir.mkdir(exist_ok=True)
@@ -834,23 +893,18 @@ class OpenClawManager:
         print(f"Backing up instance '{name}' to {output}...")
 
         try:
-            # Create backup archive
             import tarfile
 
             with tarfile.open(output, "w:gz") as tar:
-                # Add state directory
                 if instance.state_dir().exists():
                     tar.add(instance.state_dir(), arcname=f"state")
 
-                # Add config
                 if instance.config_path().exists():
                     tar.add(instance.config_path(), arcname="config.json")
 
-                # Add service file
                 if instance.service_path().exists():
                     tar.add(instance.service_path(), arcname="service")
 
-                # Add metadata
                 metadata = {
                     "name": instance.name,
                     "port": instance.port,
@@ -887,7 +941,6 @@ class OpenClawManager:
             import tarfile
 
             with tarfile.open(archive, "r:gz") as tar:
-                # Read metadata
                 metadata_file = tar.extractfile("metadata.json")
                 if metadata_file:
                     metadata = json.load(metadata_file)
@@ -897,10 +950,8 @@ class OpenClawManager:
                     print("Error: Invalid backup archive (no metadata)")
                     return False
 
-                # Determine instance name
                 restore_name = name if name else orig_name
 
-                # Check if instance exists
                 if self.registry.get(restore_name) and not force:
                     print(
                         f"Error: Instance '{restore_name}' already exists. Use --force to overwrite."
@@ -909,11 +960,9 @@ class OpenClawManager:
 
                 print(f"Restoring instance '{restore_name}' from {archive}...")
 
-                # Delete existing instance if force
                 if force and self.registry.get(restore_name):
                     self.delete_instance(restore_name, force=True)
 
-                # Create new instance
                 port = self.registry.next_port()
                 instance = Instance(
                     name=restore_name,
@@ -923,12 +972,8 @@ class OpenClawManager:
                     model=metadata.get("model", ""),
                 )
 
-                # Create directories
                 instance.state_dir().mkdir(parents=True, exist_ok=True)
 
-                # Extract state to temp location first
-                temp_extract = instance.state_dir().parent / f"temp_restore_{name}"
-                # Extract state to temp location first
                 temp_extract = (
                     instance.state_dir().parent / f"temp_restore_{restore_name}"
                 )
@@ -940,35 +985,27 @@ class OpenClawManager:
                 for member in state_members:
                     tar.extract(member, path=temp_extract)
 
-                # Move extracted state dir to final location
                 extracted = temp_extract / "state"
                 if extracted.exists():
-                    # Copy contents from extracted state to instance state dir
                     for item in extracted.iterdir():
                         dest = instance.state_dir() / item.name
                         if item.is_dir():
                             shutil.copytree(item, dest, dirs_exist_ok=True)
                         else:
                             shutil.copy2(item, dest)
-                    # Cleanup temp
                     shutil.rmtree(temp_extract)
 
-                # Extract config
                 for member in tar.getmembers():
                     if member.name == "config.json":
                         config_file = tar.extractfile(member)
                         if config_file:
                             config = json.load(config_file)
-                            # Update port in restored config
                             config["gateway"]["port"] = port
                             with open(instance.config_path(), "w") as f:
                                 json.dump(config, f, indent=2)
                         break
 
-                # Create systemd service
                 SystemdManager.create_service(instance)
-
-                # Register instance
                 self.registry.add(instance)
 
                 print(f"✓ Instance '{restore_name}' restored successfully")
@@ -982,7 +1019,6 @@ class OpenClawManager:
             print(f"Error restoring backup: {e}")
             return False
 
-
     def use_instance(self, name: str, args: List[str]) -> bool:
         """Run openclaw command within an instance's context"""
         instance = self.registry.get(name)
@@ -990,14 +1026,12 @@ class OpenClawManager:
             print(f"Error: Instance '{name}' not found")
             return False
 
-        # Build environment with instance-specific variables
         env = os.environ.copy()
         env["OPENCLAW_PROFILE"] = instance.profile
         env["OPENCLAW_CONFIG_PATH"] = str(instance.config_path())
         env["OPENCLAW_STATE_DIR"] = str(instance.state_dir())
         env["OPENCLAW_GATEWAY_PORT"] = str(instance.port)
 
-        # Build command
         cmd = [str(OPENCLAW_BIN)] + args
 
         print(f"Running in context of '{name}': {' '.join(cmd)}")
@@ -1007,7 +1041,6 @@ class OpenClawManager:
         print("-" * 50)
 
         try:
-            # Run the command
             result = subprocess.run(
                 cmd,
                 env=env,
@@ -1069,16 +1102,13 @@ class OpenClawManager:
         print("Type 'exit' to quit, 'help' for commands")
         print("-" * 50)
 
-        # Build environment
         env = os.environ.copy()
         env["OPENCLAW_PROFILE"] = instance.profile
         env["OPENCLAW_CONFIG_PATH"] = str(instance.config_path())
         env["OPENCLAW_STATE_DIR"] = str(instance.state_dir())
         env["OPENCLAW_GATEWAY_PORT"] = str(instance.port)
 
-        # Run interactive shell
         try:
-            # Use bash with custom prompt
             subprocess.run(
                 ["/bin/bash", "--norc", "--noprofile"],
                 env=env,
@@ -1181,6 +1211,9 @@ Examples:
     # Health
     subparsers.add_parser("health", help="Health check all instances")
 
+    # Update-models
+    subparsers.add_parser("update-models", help="Fetch and update models from PPQ AI")
+
     # Backup/Restore
     backup_parser = subparsers.add_parser("backup", help="Backup instance to archive")
     backup_parser.add_argument("name", help="Instance name")
@@ -1201,15 +1234,14 @@ Examples:
         "--force", action="store_true", help="Overwrite if instance exists"
     )
 
-
-    # Use - Run openclaw commands in instance context
+    # Use
     use_parser = subparsers.add_parser(
         "use", help="Run openclaw command in instance context"
     )
     use_parser.add_argument("name", help="Instance name")
     use_parser.add_argument("cmd_args", nargs="...", help="OpenClaw command and args")
 
-    # Enter - Interactive shell for instance
+    # Enter
     subparsers.add_parser("enter", help="Enter interactive shell for instance")
 
     args = parser.parse_args()
@@ -1220,13 +1252,15 @@ Examples:
 
     manager = OpenClawManager()
 
-    # Handle use command specially (variable args)
     if args.command == "use":
         cmd_args = list(args.cmd_args) if args.cmd_args else []
         success = manager.use_instance(args.name, cmd_args)
         sys.exit(0 if success else 1)
     elif args.command == "enter":
         success = manager.use_interactive()
+        sys.exit(0 if success else 1)
+    elif args.command == "update-models":
+        success = manager.update_models()
         sys.exit(0 if success else 1)
     else:
         commands = {
