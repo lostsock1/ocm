@@ -12,6 +12,60 @@ A CLI tool for managing isolated OpenClaw instances using profile-based isolatio
 - **Backup/Restore** - Full instance backup with restore capability
 - **Instance shell** - Run openclaw commands in instance context with `use` command
 - **Model sync** - Fetch available models from PPQ AI API
+- **Strict sandbox isolation** - Instances are isolated with systemd security hardening
+- **Per-instance filesystem restrictions** - Each instance can only access its own files
+
+## Security Features
+
+### Strict Sandbox Isolation
+
+All new instances are deployed with strict security hardening:
+
+```ini
+# Systemd service restrictions
+ProtectSystem=strict          # System dirs read-only
+ReadWritePaths=<instance_dir> # Only instance state + temp
+BindPaths=<config_file>       # Only own config file
+PrivateTmp=yes               # Isolated temp files
+NoNewPrivileges=yes          # No privilege escalation
+ProtectKernelTunables=yes    # Protected kernel
+ProtectControlGroups=yes    # Protected cgroups
+RestrictNamespaces=yes      # Isolated namespaces
+```
+
+### OpenClaw Sandbox Configuration
+
+Each instance automatically gets:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "sandbox": {
+        "mode": "non-main",
+        "scope": "agent",
+        "workspaceAccess": "rw"
+      }
+    }
+  },
+  "session": {
+    "dmScope": "per-channel-peer"
+  }
+}
+```
+
+### Instance Isolation
+
+| Access Level | Paths |
+|-------------|-------|
+| **READ/WRITE** | `~/.openclaw-<name>/*`, `/tmp/*`, `/var/tmp/*` |
+| **READ-ONLY** | `/usr/*`, `/boot/*`, `/etc/*` (ProtectSystem=strict) |
+| **NO ACCESS** | Main config, credentials, logs, other instances |
+
+Each instance can **only** access:
+- Its own state directory (`~/.openclaw-<name>/`)
+- Its own config file (`~/.openclaw/openclaw-<name>.json`)
+- Temporary directories
 
 ## Requirements
 
@@ -40,6 +94,12 @@ Or with Python:
 python3 ocm.py <command> [arguments]
 ```
 
+### Quick Deploy (Create + Start + Verify)
+```bash
+./ocm.py deploy worker1
+./ocm.py deploy worker2 --model minimax/minimax-m2.5
+```
+
 ### Update Models from PPQ AI
 ```bash
 ./ocm.py update-models    # Fetch all available models and update config
@@ -58,6 +118,8 @@ python3 ocm.py <command> [arguments]
 ./ocm.py status worker1    # Show detailed status
 ./ocm.py logs worker1      # View logs
 ./ocm.py health            # Health check all instances
+./ocm.py enable worker1    # Enable autostart
+./ocm.py disable worker1   # Disable autostart
 ```
 
 ### Run OpenClaw Commands in Instance Context
@@ -69,7 +131,7 @@ python3 ocm.py <command> [arguments]
 
 ### Enter Interactive Shell
 ```bash
-./ocm.py enter  # Select instance and open shell
+./ocm.py enter worker1  # Open shell for instance
 ```
 
 ### Backup and Restore
@@ -78,10 +140,16 @@ python3 ocm.py <command> [arguments]
 ./ocm.py restore ~/backups/mybackup.tar.gz        # Restore from archive
 ```
 
+### Edit Configuration
+```bash
+./ocm.py edit worker1 agents.defaults.model "minimax/minimax-m2.5"
+```
+
 ## Commands
 
 | Command | Description |
 |---------|-------------|
+| `deploy <name>` | Create, start, and verify instance |
 | `create <name>` | Create new instance |
 | `delete <name>` | Delete instance |
 | `edit <name> <key> <value>` | Edit config |
@@ -93,12 +161,44 @@ python3 ocm.py <command> [arguments]
 | `disable <name>` | Disable autostart |
 | `status <name>` | Show instance status |
 | `logs <name>` | View instance logs |
-| `health` | Health check all |
+| `-f, --follow` | Follow logs in real-time |
+| `health` | Health check all instances |
 | `update-models` | Fetch models from PPQ AI API |
 | `backup <name>` | Backup instance |
 | `restore <archive>` | Restore from archive |
 | `use <name> <cmd>` | Run openclaw command |
-| `enter` | Interactive shell |
+| `enter <name>` | Interactive shell |
+
+## Instance Independence
+
+Each instance runs completely independently:
+
+- **Separate process** - Each instance has its own gateway process
+- **Separate port** - Unique port allocation (18789 + 20n)
+- **Separate config** - Own config file with isolated settings
+- **Separate state** - Own state directory with workspace
+- **Separate systemd service** - Can be started/stopped independently
+
+The main gateway (port 18789) is **optional** - instances can run without it.
+
+## Filesystem Access
+
+### Per-Instance Restrictions
+
+When you create an instance named `worker1`:
+
+```
+✅ Can Write:
+  - /home/debian/.openclaw-worker1/ (state directory)
+  - /home/debian/.openclaw/openclaw-worker1.json (config)
+  - /tmp/*, /var/tmp/* (temp)
+
+❌ Cannot Access:
+  - /home/debian/.openclaw/openclaw.json (main config)
+  - /home/debian/.openclaw/credentials/ (API keys)
+  - /home/debian/.openclaw/logs/ (audit logs)
+  - Other instances' directories
+```
 
 ## License
 
